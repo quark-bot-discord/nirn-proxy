@@ -37,6 +37,9 @@ type PriorityLimiter struct {
 type limiterWaiter struct {
 	ch      chan struct{}
 	granted bool
+	// grantedIn is the window the token came from, so a token handed back
+	// after the window rolled over is not added to the next one.
+	grantedIn time.Time
 }
 
 func NewPriorityLimiter(capacity uint, window time.Duration) *PriorityLimiter {
@@ -93,6 +96,7 @@ func (l *PriorityLimiter) grant(now time.Time) {
 		for q.Len() > 0 && l.remaining > 0 {
 			w := q.Remove(q.Front()).(*limiterWaiter)
 			w.granted = true
+			w.grantedIn = l.reset
 			l.remaining--
 			close(w.ch)
 		}
@@ -131,7 +135,9 @@ func (l *PriorityLimiter) schedule(now time.Time) {
 func (l *PriorityLimiter) onTimer() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.timer = nil
+	// The timer is not cleared here: schedule() may already have re-armed it
+	// for a later window while this call waited for mu, and clearing it would
+	// orphan that one. grant() re-arms or stops it as needed.
 	l.grant(l.now())
 }
 
@@ -186,7 +192,7 @@ func (l *PriorityLimiter) abandon(p Priority, elem *list.Element, w *limiterWait
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if w.granted {
-		if l.remaining < l.capacity {
+		if w.grantedIn.Equal(l.reset) && l.remaining < l.capacity {
 			l.remaining++
 		}
 		l.grant(l.now())

@@ -181,3 +181,26 @@ func TestLimiterThroughputUnderContention(t *testing.T) {
 		t.Fatalf("waiters left behind: %v", w)
 	}
 }
+
+// A token granted in one window and handed back after the window rolled over
+// must not inflate the next window past capacity.
+func TestLimiterReturnedTokenStaysInItsWindow(t *testing.T) {
+	l := NewPriorityLimiter(1, 50*time.Millisecond)
+	mustTake(t, l, PriorityNormal)
+	w := &limiterWaiter{ch: make(chan struct{}), granted: true, grantedIn: l.reset}
+	elem := l.waiters[PriorityNormal].PushBack(&limiterWaiter{})
+	l.waiters[PriorityNormal].Remove(elem)
+	time.Sleep(60 * time.Millisecond)
+	l.mu.Lock()
+	l.refill(l.now()) // new window: remaining = 1
+	l.mu.Unlock()
+	_ = l.abandon(PriorityNormal, elem, w, ErrShed)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.remaining > l.capacity {
+		t.Fatalf("remaining %d exceeds capacity %d", l.remaining, l.capacity)
+	}
+	if l.remaining != 1 {
+		t.Fatalf("stale token was added to the new window: remaining %d", l.remaining)
+	}
+}

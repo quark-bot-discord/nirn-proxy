@@ -78,9 +78,9 @@ In the future, this will be the only possible behavior.
 ##### DEFAULT_MAX_WAIT_MS
 How long a request may wait for rate limits (its bucket and the global limit) before the proxy drops it, for requests that do not send `x-quark-max-wait-ms`. A dropped request is answered at once with `503`, `x-quark-shed-reason` and `x-quark-not-sent: true`, and is never sent to Discord, so the client can retry it with no risk of a duplicate. `0` disables the limit.
 
-Keep it below the client's own request timeout. Past that the client has gone and the request is only using up capacity.
+If you set it, keep it below the shortest client request timeout, because past that the client has already gone. Leave it at `0` if some clients cannot handle a 503 or use routes whose rate-limit reset is longer than the limit. Quark's bots send `x-quark-max-wait-ms` themselves, so they don't need this.
 
-Default: 25000
+Default: 0
 
 ## Request headers (Quark fork)
 Optional. All `x-quark-*` headers are removed before a request is forwarded to Discord.
