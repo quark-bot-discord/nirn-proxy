@@ -42,6 +42,9 @@ type QueueManager struct {
 	localNodeName            string
 	localNodeIP              string
 	localNodeProxyListenAddr string
+	// defaultMaxWait applies to requests that do not send HeaderMaxWaitMs.
+	// Zero means they wait indefinitely, as before.
+	defaultMaxWait time.Duration
 }
 
 func onEvictLruItem(key interface{}, value interface{}) {
@@ -63,7 +66,54 @@ func NewQueueManager(bufferSize int, maxBearerLruSize int) *QueueManager {
 		clusterGlobalRateLimiter: NewClusterGlobalRateLimiter(),
 	}
 
+	RegisterGlobalWaitingGauges(q.clusterGlobalRateLimiter.waiting)
+
 	return q
+}
+
+// SetDefaultMaxWait sets the deadline for requests that do not carry
+// HeaderMaxWaitMs. Call before serving.
+func (m *QueueManager) SetDefaultMaxWait(d time.Duration) {
+	m.defaultMaxWait = d
+}
+
+func botHashFor(q *RequestQueue) uint64 {
+	if q.user != nil {
+		return HashCRC64(q.user.Id)
+	}
+	return 0
+}
+
+// attachGlobal wires a queue to the global limiter. The token is now taken by
+// the bucket's subscriber immediately before sending, not by the HTTP handler
+// on arrival: a token taken on arrival was spent even when the request then
+// waited minutes in its bucket and was abandoned, and the limiter's count no
+// longer described what was actually reaching Discord.
+func (m *QueueManager) attachGlobal(q *RequestQueue) {
+	if q.identifier == "NoAuth" {
+		return
+	}
+	q.takeGlobal = func(ctx context.Context, item *QueueItem) error {
+		botHash := botHashFor(q)
+		globalRouteTo := m.calculateRoute(botHash)
+		if globalRouteTo == "" || q.queueType == Bearer {
+			return m.clusterGlobalRateLimiter.Take(ctx, botHash, q.botLimit, item.Priority, item.Deadline)
+		}
+		return m.clusterGlobalRateLimiter.FireGlobalRequest(ctx, globalRouteTo, botHash, q.botLimit, item.Priority, item.Deadline)
+	}
+	q.lockGlobal = func(until time.Time) {
+		botHash := botHashFor(q)
+		globalRouteTo := m.calculateRoute(botHash)
+		if globalRouteTo == "" || q.queueType == Bearer {
+			m.clusterGlobalRateLimiter.LockUntil(botHash, q.botLimit, until)
+			return
+		}
+		go func() {
+			if err := m.clusterGlobalRateLimiter.FireGlobalLock(globalRouteTo, botHash, q.botLimit, until); err != nil {
+				logger.WithField("function", "FireGlobalLock").Warn(err)
+			}
+		}()
+	}
 }
 
 func (m *QueueManager) Shutdown() {
@@ -214,6 +264,7 @@ func (m *QueueManager) getOrCreateBotQueue(token string) (*RequestQueue, error) 
 				return nil, err
 			}
 
+			m.attachGlobal(q)
 			m.queues[token] = q
 		}
 	}
@@ -233,13 +284,16 @@ func (m *QueueManager) getOrCreateBearerQueue(token string) (*RequestQueue, erro
 		q, ok = m.bearerQueues.Get(token)
 		if !ok {
 			var err error
-			q, err = NewRequestQueue(ProcessRequest, token, 5)
+			var created *RequestQueue
+			created, err = NewRequestQueue(ProcessRequest, token, 5)
 
 			if err != nil {
 				return nil, err
 			}
 
-			m.bearerQueues.Add(token, q)
+			m.attachGlobal(created)
+			m.bearerQueues.Add(token, created)
+			q = created
 		}
 	}
 
@@ -288,6 +342,14 @@ func (m *QueueManager) fulfillRequest(resp *http.ResponseWriter, req *http.Reque
 		RequestsRoutedRecv.Inc()
 	}
 
+	priority := ParsePriority(req.Header.Get(HeaderPriority))
+	deadline := RequestDeadline(req.Header, reqStart, m.defaultMaxWait)
+	if !deadline.IsZero() {
+		// Pinned as an absolute time so a request routed to another node does
+		// not start a fresh budget there.
+		req.Header.Set(HeaderDeadlineMs, strconv.FormatInt(deadline.UnixMilli(), 10))
+	}
+
 	var err error
 	if routeTo == "" || routeToHeader != "" {
 		var q *RequestQueue
@@ -311,28 +373,7 @@ func (m *QueueManager) fulfillRequest(resp *http.ResponseWriter, req *http.Reque
 			return
 		}
 
-		if q.identifier != "NoAuth" {
-			var botHash uint64 = 0
-			if q.user != nil {
-				botHash = HashCRC64(q.user.Id)
-			}
-
-			botLimit := q.botLimit
-			globalRouteTo := m.calculateRoute(botHash)
-
-			if globalRouteTo == "" || queueType == Bearer {
-				m.clusterGlobalRateLimiter.Take(botHash, botLimit)
-			} else {
-				err = m.clusterGlobalRateLimiter.FireGlobalRequest(req.Context(), globalRouteTo, botHash, botLimit)
-				if err != nil {
-					logEntry.WithField("function", "FireGlobalRequest").Error(err)
-					ErrorCounter.Inc()
-					Generate429(resp)
-					return
-				}
-			}
-		}
-		err = q.Queue(req, resp, path, pathHash)
+		err = q.Queue(req, resp, path, pathHash, priority, deadline, reqStart)
 		if err != nil {
 			log := logEntry.WithField("function", "Queue")
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
@@ -378,14 +419,46 @@ func (m *QueueManager) HandleGlobal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	m.clusterGlobalRateLimiter.Take(botHash, uint(botLimit))
-	logger.Trace("Returned OK for global request")
+	priority := ParsePriority(r.Header.Get(HeaderPriority))
+	deadline := RequestDeadline(r.Header, time.Now(), 0)
+
+	err = m.clusterGlobalRateLimiter.Take(r.Context(), botHash, uint(botLimit), priority, deadline)
+	switch {
+	case err == nil:
+		w.WriteHeader(http.StatusOK)
+		logger.Trace("Returned OK for global request")
+	case errors.Is(err, ErrShed):
+		w.WriteHeader(http.StatusServiceUnavailable)
+	default:
+		// The requesting node went away; nobody is reading the answer.
+	}
+}
+
+func (m *QueueManager) HandleGlobalLock(w http.ResponseWriter, r *http.Request) {
+	botHash, err := strconv.ParseUint(r.Header.Get("bot-hash"), 10, 64)
+	if err != nil {
+		w.WriteHeader(400)
+		return
+	}
+	botLimit, err := strconv.ParseUint(r.Header.Get("bot-limit"), 10, 64)
+	if err != nil {
+		w.WriteHeader(400)
+		return
+	}
+	untilMs, err := strconv.ParseInt(r.Header.Get("lock-until-ms"), 10, 64)
+	if err != nil {
+		w.WriteHeader(400)
+		return
+	}
+	m.clusterGlobalRateLimiter.LockUntil(botHash, uint(botLimit), time.UnixMilli(untilMs))
+	w.WriteHeader(http.StatusOK)
 }
 
 func (m *QueueManager) CreateMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", m.DiscordRequestHandler)
 	mux.HandleFunc("/nirn/global", m.HandleGlobal)
+	mux.HandleFunc("/nirn/global-lock", m.HandleGlobalLock)
 	mux.HandleFunc("/nirn/healthz", func(writer http.ResponseWriter, request *http.Request) {
 		writer.WriteHeader(200)
 	})

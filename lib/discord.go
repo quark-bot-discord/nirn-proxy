@@ -255,7 +255,9 @@ func ProcessRequest(ctx context.Context, item *QueueItem) (*http.Response, error
 
 	ctx, cancel := context.WithTimeout(ctx, contextTimeout)
 	defer cancel()
-	discordResp, err := doDiscordReq(ctx, req.URL.Path, req.Method, req.Body, req.Header.Clone(), req.URL.RawQuery)
+	header := req.Header.Clone()
+	StripQuarkHeaders(header)
+	discordResp, err := doDiscordReq(ctx, req.URL.Path, req.Method, req.Body, header, req.URL.RawQuery)
 
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
