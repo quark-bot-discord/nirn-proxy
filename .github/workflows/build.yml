@@ -1,0 +1,134 @@
+name: Build and Push Docker Image
+
+# Builds ghcr.io/quark-bot-discord/nirn-proxy and, on `main`, deploys it.
+#
+# This repo is public, so nothing here runs on the self-hosted runner: that
+# runner can restart cluster workloads, and a public repo lets anyone open a
+# pull request that edits this file. The build runs on a GitHub-hosted runner
+# and the deploy is handed to quark-k8s (private), whose workflow does the
+# restart on the self-hosted runner.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+
+# One run on `main` at a time, in push order. Two builds side by side could
+# finish out of order and leave the older image under the tag, and so in the
+# cluster. Any other ref is a group of its own.
+concurrency:
+  group: build-${{ github.ref == 'refs/heads/main' && github.ref || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/quark-bot-discord/nirn-proxy
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Pull requests build only. Their token cannot push anyway.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `:main` is what quark-k8s runs. `:sha-<short>` is kept for rolling back
+      # by hand; `vX.Y.Z` tags get their own tag.
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Put the image that was just pushed into service, by starting
+  # quark-k8s/.github/workflows/deploy-nirn-proxy.yml. That workflow restarts
+  # pro-proxy, main-proxy and webhook-proxy-0/1/2, which pull `:main` with
+  # `imagePullPolicy: Always`, so a restart is the deploy.
+  #
+  # Needs the secret QUARK_K8S_DEPLOY_TOKEN: a fine-grained token for
+  # quark-bot-discord/quark-k8s only, with "Actions: Read and write" and
+  # nothing else. That lets it start a workflow there, not change code.
+  #
+  # To push without deploying, put [skip deploy] in the message of the last
+  # commit pushed. For a pull request merged with a merge commit that message
+  # includes the PR's title, so put it there. It covers that push only, and
+  # the image is still built and pushed: any pod that starts afterwards runs
+  # it, and the next push deploys it.
+  deploy:
+    name: Deploy
+    needs: build
+    if: >-
+      github.event_name == 'push'
+      && github.ref == 'refs/heads/main'
+      && !contains(github.event.head_commit.message, '[skip deploy]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Start the deploy in quark-k8s
+        env:
+          GH_TOKEN: ${{ secrets.QUARK_K8S_DEPLOY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::QUARK_K8S_DEPLOY_TOKEN is not set. The image is pushed; nothing was restarted."
+            exit 1
+          fi
+          gh workflow run deploy-nirn-proxy.yml \
+            --repo quark-bot-discord/quark-k8s \
+            --ref main \
+            -f sha="$GITHUB_SHA"
+          {
+            echo "Deploy of \`${GITHUB_SHA::7}\` started in quark-k8s."
+            echo "Follow it at https://github.com/quark-bot-discord/quark-k8s/actions/workflows/deploy-nirn-proxy.yml"
+          } >> "$GITHUB_STEP_SUMMARY"
