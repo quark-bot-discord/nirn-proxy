@@ -1,12 +1,6 @@
 name: Build and Push Docker Image
 
 # Builds ghcr.io/quark-bot-discord/nirn-proxy and, on `main`, deploys it.
-#
-# This repo is public, so nothing here runs on the self-hosted runner: that
-# runner can restart cluster workloads, and a public repo lets anyone open a
-# pull request that edits this file. The build runs on a GitHub-hosted runner
-# and the deploy is handed to quark-k8s (private), whose workflow does the
-# restart on the self-hosted runner.
 
 on:
   push:
@@ -90,14 +84,18 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Put the image that was just pushed into service, by starting
-  # quark-k8s/.github/workflows/deploy-nirn-proxy.yml. That workflow restarts
-  # pro-proxy, main-proxy and webhook-proxy-0/1/2, which pull `:main` with
-  # `imagePullPolicy: Always`, so a restart is the deploy.
+  # Put the image that was just pushed into service.
   #
-  # Needs the secret QUARK_K8S_DEPLOY_TOKEN: a fine-grained token for
-  # quark-bot-discord/quark-k8s only, with "Actions: Read and write" and
-  # nothing else. That lets it start a workflow there, not change code.
+  # Every proxy pulls `:main` with `imagePullPolicy: Always`, so a restart is
+  # the deploy. The runner is a pod in the cluster; kubectl picks up its
+  # service account, which may restart these and nothing else
+  # (quark-k8s: app-services/ci-deploy-rbac.yaml).
+  #
+  # One at a time, pro first, so a build that does not start stops at
+  # pro-proxy and leaves main and the webhook proxies on the old one. The
+  # webhook proxies are single-replica StatefulSets on hostNetwork: each
+  # restart stops the old pod before starting the new one, and nirn-proxy
+  # drains its queues on SIGTERM within the 30s grace period.
   #
   # To push without deploying, put [skip deploy] in the message of the last
   # commit pushed. For a pull request merged with a merge commit that message
@@ -111,24 +109,52 @@ jobs:
       github.event_name == 'push'
       && github.ref == 'refs/heads/main'
       && !contains(github.event.head_commit.message, '[skip deploy]')
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    runs-on: self-hosted
+    timeout-minutes: 45
+
+    env:
+      NAMESPACE: app-services
+      IMAGE: ghcr.io/quark-bot-discord/nirn-proxy:main
+      # kind/name, in restart order
+      WORKLOADS: >-
+        deployment/pro-proxy
+        deployment/main-proxy
+        statefulset/webhook-proxy-0
+        statefulset/webhook-proxy-1
+        statefulset/webhook-proxy-2
 
     steps:
-      - name: Start the deploy in quark-k8s
-        env:
-          GH_TOKEN: ${{ secrets.QUARK_K8S_DEPLOY_TOKEN }}
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      # Until the quark-k8s manifests are applied the proxies still run the
+      # upstream image, and a restart would deploy nothing. Fail before
+      # touching anything.
+      - name: Check every proxy runs this image
         run: |
           set -euo pipefail
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::error::QUARK_K8S_DEPLOY_TOKEN is not set. The image is pushed; nothing was restarted."
-            exit 1
-          fi
-          gh workflow run deploy-nirn-proxy.yml \
-            --repo quark-bot-discord/quark-k8s \
-            --ref main \
-            -f sha="$GITHUB_SHA"
-          {
-            echo "Deploy of \`${GITHUB_SHA::7}\` started in quark-k8s."
-            echo "Follow it at https://github.com/quark-bot-discord/quark-k8s/actions/workflows/deploy-nirn-proxy.yml"
-          } >> "$GITHUB_STEP_SUMMARY"
+          bad=0
+          for w in $WORKLOADS; do
+            img=$(kubectl -n "$NAMESPACE" get "$w" -o jsonpath='{.spec.template.spec.containers[0].image}')
+            if [ "$img" != "$IMAGE" ]; then
+              echo "::error::$w runs $img, not $IMAGE. Apply the quark-k8s proxy manifests first."
+              bad=1
+            fi
+          done
+          exit $bad
+
+      - name: Restart and wait
+        run: |
+          set -euo pipefail
+          for w in $WORKLOADS; do
+            kubectl -n "$NAMESPACE" rollout restart "$w"
+            kubectl -n "$NAMESPACE" rollout status "$w" --timeout=5m
+            echo "\`$w\` restarted and rolled out." >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Show the pods
+        if: always()
+        run: |
+          for w in $WORKLOADS; do
+            kubectl -n "$NAMESPACE" get pods -l "app=${w#*/}" -o wide || true
+          done
