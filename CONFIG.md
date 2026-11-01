@@ -75,6 +75,25 @@ Default: false
 
 In the future, this will be the only possible behavior.
 
+##### DEFAULT_MAX_WAIT_MS
+How long a request may wait for rate limits (its bucket and the global limit) before the proxy drops it, for requests that do not send `x-quark-max-wait-ms`. A dropped request is answered at once with `503`, `x-quark-shed-reason` and `x-quark-not-sent: true`, and is never sent to Discord, so the client can retry it with no risk of a duplicate. `0` disables the limit.
+
+If you set it, keep it below the shortest client request timeout, because past that the client has already gone. Leave it at `0` if some clients cannot handle a 503 or use routes whose rate-limit reset is longer than the limit. Quark's bots send `x-quark-max-wait-ms` themselves, so they don't need this.
+
+Default: 0
+
+## Request headers (Quark fork)
+Optional. All `x-quark-*` headers are removed before a request is forwarded to Discord.
+
+- `x-quark-priority`: `high`, `normal` (default) or `low`. When the global limit is exhausted, waiting requests get tokens strictly in this order. Under sustained overload, low-priority requests wait until their deadline and are shed.
+- `x-quark-max-wait-ms`: this request's wait budget, overriding `DEFAULT_MAX_WAIT_MS`.
+
+## Behaviour changes in this fork
+- The global token is taken immediately before a request is sent, not when it arrives. A request that waits in its bucket and is then abandoned no longer uses up the budget.
+- A request whose client has disconnected is dropped without being sent, and without taking a token.
+- A global 429 from Discord pauses the whole global limiter until it expires. Before, the lock was recorded and never read.
+- Metrics: `nirn_proxy_global_wait_seconds`, `nirn_proxy_queue_wait_seconds`, `nirn_proxy_shed_total`, `nirn_proxy_cancelled_before_send_total`, `nirn_proxy_global_429_total`, `nirn_proxy_global_waiting`. Any increase in `nirn_proxy_global_429_total` means the configured global limit is above Discord's. Lower it with `BOT_RATELIMIT_OVERRIDES`. If several proxy pods run without clustering, divide the limit by the number of pods, because each pod enforces the limit on its own.
+
 ## Unstable env vars
 Collection of env vars that may be removed at any time, mainly used for Discord introducing new behaviour on their edge api versions
 

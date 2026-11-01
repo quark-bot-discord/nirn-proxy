@@ -87,6 +87,7 @@ func main() {
 	maxBearerLruSize := lib.EnvGetInt("MAX_BEARER_COUNT", 1024)
 
 	manager := lib.NewQueueManager(bufferSize, maxBearerLruSize)
+	manager.SetDefaultMaxWait(time.Duration(lib.EnvGetInt("DEFAULT_MAX_WAIT_MS", 0)) * time.Millisecond)
 
 	mux := manager.CreateMux()
 

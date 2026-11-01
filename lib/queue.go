@@ -19,6 +19,12 @@ type QueueItem struct {
 	Res      *http.ResponseWriter
 	doneChan chan *http.Response
 	errChan  chan error
+	// Priority decides the order in which waiting requests get global tokens.
+	Priority Priority
+	// Deadline is when the request stops being worth sending. Zero means none.
+	Deadline time.Time
+	// Arrived is when the proxy first saw the request, for metrics.
+	Arrived time.Time
 }
 
 type QueueChannel struct {
@@ -28,7 +34,6 @@ type QueueChannel struct {
 
 type RequestQueue struct {
 	sync.RWMutex
-	globalLockedUntil *int64
 	// bucket path hash as key
 	queues       map[uint64]*QueueChannel
 	processor    func(ctx context.Context, item *QueueItem) (*http.Response, error)
@@ -40,6 +45,11 @@ type RequestQueue struct {
 	isTokenInvalid *int64
 	botLimit       uint
 	queueType      QueueType
+	// takeGlobal waits for a global token immediately before the request is
+	// sent. Nil means no global limit (NoAuth). Set by the QueueManager.
+	takeGlobal func(ctx context.Context, item *QueueItem) error
+	// lockGlobal pauses the global limiter after a global 429. May be nil.
+	lockGlobal func(until time.Time)
 }
 
 func NewRequestQueue(processor func(ctx context.Context, item *QueueItem) (*http.Response, error), token string, bufferSize int) (*RequestQueue, error) {
@@ -65,15 +75,14 @@ func NewRequestQueue(processor func(ctx context.Context, item *QueueItem) (*http
 			var invalid = new(int64)
 			*invalid = 999
 			return &RequestQueue{
-				queues:            make(map[uint64]*QueueChannel),
-				processor:         processor,
-				globalBucket:      globalBucket,
-				globalLockedUntil: new(int64),
-				bufferSize:        bufferSize,
-				user:              nil,
-				identifier:        "InvalidTokenQueue",
-				isTokenInvalid:    invalid,
-				botLimit:          limit,
+				queues:         make(map[uint64]*QueueChannel),
+				processor:      processor,
+				globalBucket:   globalBucket,
+				bufferSize:     bufferSize,
+				user:           nil,
+				identifier:     "InvalidTokenQueue",
+				isTokenInvalid: invalid,
+				botLimit:       limit,
 			}, nil
 		}
 
@@ -91,16 +100,15 @@ func NewRequestQueue(processor func(ctx context.Context, item *QueueItem) (*http
 	}
 
 	ret := &RequestQueue{
-		queues:            make(map[uint64]*QueueChannel),
-		processor:         processor,
-		globalBucket:      globalBucket,
-		globalLockedUntil: new(int64),
-		bufferSize:        bufferSize,
-		user:              user,
-		identifier:        identifier,
-		isTokenInvalid:    new(int64),
-		botLimit:          limit,
-		queueType:         queueType,
+		queues:         make(map[uint64]*QueueChannel),
+		processor:      processor,
+		globalBucket:   globalBucket,
+		bufferSize:     bufferSize,
+		user:           user,
+		identifier:     identifier,
+		isTokenInvalid: new(int64),
+		botLimit:       limit,
+		queueType:      queueType,
 	}
 
 	if queueType != Bearer {
@@ -146,18 +154,47 @@ func (q *RequestQueue) tickSweep() {
 	}
 }
 
-func safeSend(queue *QueueChannel, value *QueueItem) {
+var errQueueClosed = errors.New("failed to send due to closed channel, sending 429 for client to retry")
+
+type enqueueResult int
+
+const (
+	enqueued enqueueResult = iota
+	enqueueClosed
+	enqueueCancelled
+	enqueueDeadline
+)
+
+// enqueue puts the item on its bucket's channel. A full channel used to block
+// here with no way out: the client could time out and leave, and the request
+// still waited for a slot. Now it gives up when the client does, or when the
+// request's deadline passes.
+func enqueue(queue *QueueChannel, item *QueueItem) (result enqueueResult) {
 	defer func() {
+		// Sending on a channel the sweeper closed panics.
 		if recover() != nil {
-			value.errChan <- errors.New("failed to send due to closed channel, sending 429 for client to retry")
-			Generate429(value.Res)
+			result = enqueueClosed
 		}
 	}()
 
-	queue.ch <- value
+	var deadlineC <-chan time.Time
+	if !item.Deadline.IsZero() {
+		t := time.NewTimer(time.Until(item.Deadline))
+		defer t.Stop()
+		deadlineC = t.C
+	}
+
+	select {
+	case queue.ch <- item:
+		return enqueued
+	case <-item.Req.Context().Done():
+		return enqueueCancelled
+	case <-deadlineC:
+		return enqueueDeadline
+	}
 }
 
-func (q *RequestQueue) Queue(req *http.Request, res *http.ResponseWriter, path string, pathHash uint64) error {
+func (q *RequestQueue) Queue(req *http.Request, res *http.ResponseWriter, path string, pathHash uint64, priority Priority, deadline time.Time, arrived time.Time) error {
 	logger.WithFields(logrus.Fields{
 		"bucket": path,
 		"path":   req.URL.Path,
@@ -169,7 +206,30 @@ func (q *RequestQueue) Queue(req *http.Request, res *http.ResponseWriter, path s
 	doneChan := make(chan *http.Response)
 	errChan := make(chan error)
 
-	safeSend(ch, &QueueItem{req, res, doneChan, errChan})
+	item := &QueueItem{
+		Req:      req,
+		Res:      res,
+		doneChan: doneChan,
+		errChan:  errChan,
+		Priority: priority,
+		Deadline: deadline,
+		Arrived:  arrived,
+	}
+
+	switch enqueue(ch, item) {
+	case enqueueClosed:
+		// The previous code sent this error on errChan from inside the
+		// recover, before anything was receiving from it - a goroutine leak
+		// per occurrence.
+		Generate429(res)
+		return errQueueClosed
+	case enqueueCancelled:
+		observeDropped(item, "cancelled", "")
+		return req.Context().Err()
+	case enqueueDeadline:
+		shed(item, ShedReasonQueueDeadline)
+		return nil
+	}
 
 	select {
 	case <-doneChan:
@@ -283,6 +343,76 @@ func isInteraction(url string) bool {
 	return false
 }
 
+// observeDropped records a request that will not be sent.
+func observeDropped(item *QueueItem, outcome string, reason string) {
+	labels := map[string]string{"priority": item.Priority.String(), "outcome": outcome}
+	QueueWaitHistogram.With(labels).Observe(time.Since(item.Arrived).Seconds())
+	if outcome == "cancelled" {
+		CancelledBeforeSendCounter.With(map[string]string{"priority": item.Priority.String()}).Inc()
+	} else if reason != "" {
+		ShedCounter.With(map[string]string{"reason": reason, "priority": item.Priority.String()}).Inc()
+	}
+}
+
+// shed answers a request that will not be sent, without contacting Discord.
+// Only called before the response has been written.
+func shed(item *QueueItem, reason string) {
+	observeDropped(item, "shed", reason)
+	WriteShed(*item.Res, reason)
+}
+
+// shedInQueue is shed for an item the subscriber owns: the client goroutine is
+// waiting on doneChan.
+func shedInQueue(item *QueueItem, reason string) {
+	shed(item, reason)
+	item.doneChan <- nil
+}
+
+// expired reports whether the item's deadline has passed.
+func (item *QueueItem) expired(now time.Time) bool {
+	return !item.Deadline.IsZero() && !now.Before(item.Deadline)
+}
+
+// readyToSend is the last check before a request costs a global token and a
+// Discord call. It returns false, having answered the client, when the request
+// is no longer worth sending.
+//
+// The original loop sent everything it dequeued. A request whose client had
+// timed out minutes earlier was still given a global token, then failed on
+// its cancelled context - so under overload the limiter spent its budget on
+// requests nobody was waiting for, and the queue never drained.
+func (q *RequestQueue) readyToSend(item *QueueItem) bool {
+	if err := item.Req.Context().Err(); err != nil {
+		observeDropped(item, "cancelled", "")
+		item.errChan <- err
+		return false
+	}
+	if item.expired(time.Now()) {
+		shedInQueue(item, ShedReasonQueueDeadline)
+		return false
+	}
+	if q.takeGlobal == nil {
+		return true
+	}
+	err := q.takeGlobal(item.Req.Context(), item)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, ErrShed):
+		shedInQueue(item, ShedReasonGlobalDeadline)
+	case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+		observeDropped(item, "cancelled", "")
+		item.errChan <- err
+	default:
+		// The cluster's global node could not be reached. Same answer as
+		// before this change: a generated 429 so the client retries.
+		ErrorCounter.Inc()
+		Generate429(item.Res)
+		item.errChan <- err
+	}
+	return false
+}
+
 func (q *RequestQueue) subscribe(ch *QueueChannel, path string, pathHash uint64) {
 	// This function has 1 goroutine for each bucket path
 	// Locking here is not needed
@@ -305,6 +435,11 @@ func (q *RequestQueue) subscribe(ch *QueueChannel, path string, pathHash uint64)
 			continue
 		}
 
+		if !q.readyToSend(item) {
+			continue
+		}
+		QueueWaitHistogram.With(map[string]string{"priority": item.Priority.String(), "outcome": "sent"}).Observe(time.Since(item.Arrived).Seconds())
+
 		resp, err := q.processor(ctx, item)
 		if err != nil {
 			item.errChan <- err
@@ -316,14 +451,18 @@ func (q *RequestQueue) subscribe(ch *QueueChannel, path string, pathHash uint64)
 		_, remaining, resetAfter, isGlobal, err := parseHeaders(&resp.Header, scope != "user")
 
 		if isGlobal {
-			//Lock global
-			sw := atomic.CompareAndSwapInt64(q.globalLockedUntil, 0, time.Now().Add(resetAfter).UnixNano())
-			if sw {
-				logger.WithFields(logrus.Fields{
-					"until":      time.Now().Add(resetAfter),
-					"resetAfter": resetAfter,
-				}).Warn("Global reached, locking")
+			// Pause the whole bot's global limiter until Discord's lock
+			// expires. The previous code compare-and-swapped a timestamp that
+			// nothing ever read, so every bucket kept sending into the lock.
+			Global429Counter.Inc()
+			until := time.Now().Add(resetAfter)
+			if resetAfter > 0 && q.lockGlobal != nil {
+				q.lockGlobal(until)
 			}
+			logger.WithFields(logrus.Fields{
+				"until":      until,
+				"resetAfter": resetAfter,
+			}).Warn("Global reached, locking")
 		}
 
 		if err != nil {
