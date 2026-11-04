@@ -90,6 +90,8 @@ func RegisterGlobalWaitingGauges(source func() [priorityCount]int) {
 func StartMetrics(addr string) {
 	prometheus.MustRegister(RequestHistogram)
 	http.Handle("/metrics", promhttp.Handler())
+	// The last 15 minutes as JSON, for the status site (see health.go).
+	http.HandleFunc("/healthz", HealthHandler)
 	logger.Info("Starting metrics server on " + addr)
 	err := http.ListenAndServe(addr, nil)
 	if err != nil {

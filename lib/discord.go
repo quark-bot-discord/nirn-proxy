@@ -245,6 +245,10 @@ func doDiscordReq(ctx context.Context, path string, method string, body io.ReadC
 		}
 
 		RequestHistogram.With(map[string]string{"route": route, "status": status, "method": method, "clientId": identifier.(string)}).Observe(elapsed)
+		proxyHealth.observeResponse(discordResp, time.Since(startTime))
+	} else if ctx.Err() == nil {
+		// A caller that gave up is not Discord failing; anything else is.
+		proxyHealth.observeTransportError()
 	}
 	return discordResp, err
 }

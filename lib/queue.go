@@ -351,6 +351,7 @@ func observeDropped(item *QueueItem, outcome string, reason string) {
 		CancelledBeforeSendCounter.With(map[string]string{"priority": item.Priority.String()}).Inc()
 	} else if reason != "" {
 		ShedCounter.With(map[string]string{"reason": reason, "priority": item.Priority.String()}).Inc()
+		proxyHealth.observeShed(reason)
 	}
 }
 
