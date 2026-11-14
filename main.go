@@ -88,6 +88,10 @@ func main() {
 
 	manager := lib.NewQueueManager(bufferSize, maxBearerLruSize)
 	manager.SetDefaultMaxWait(time.Duration(lib.EnvGetInt("DEFAULT_MAX_WAIT_MS", 0)) * time.Millisecond)
+	lib.ConfigureLongRatelimits(
+		time.Duration(lib.EnvGetInt("LONG_RATELIMIT_FAIL_FAST_MS", 10000))*time.Millisecond,
+		time.Duration(lib.EnvGetInt("ROUTE_LOCK_MIN_RESET_MS", 600000))*time.Millisecond,
+	)
 
 	mux := manager.CreateMux()
 
