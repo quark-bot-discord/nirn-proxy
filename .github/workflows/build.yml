@@ -122,6 +122,7 @@ jobs:
         statefulset/webhook-proxy-0
         statefulset/webhook-proxy-1
         statefulset/webhook-proxy-2
+        deployment/web-proxy
 
     steps:
       - name: Install kubectl
@@ -135,6 +136,12 @@ jobs:
           set -euo pipefail
           bad=0
           for w in $WORKLOADS; do
+            # A workload not created yet (web-proxy, until quark-k8s#38 is
+            # applied) is skipped, not a reason to hold back the others.
+            if ! kubectl -n "$NAMESPACE" get "$w" >/dev/null 2>&1; then
+              echo "::warning::$w does not exist (or is not visible to the runner) - skipped"
+              continue
+            fi
             img=$(kubectl -n "$NAMESPACE" get "$w" -o jsonpath='{.spec.template.spec.containers[0].image}')
             if [ "$img" != "$IMAGE" ]; then
               echo "::error::$w runs $img, not $IMAGE. Apply the quark-k8s proxy manifests first."
@@ -147,6 +154,10 @@ jobs:
         run: |
           set -euo pipefail
           for w in $WORKLOADS; do
+            if ! kubectl -n "$NAMESPACE" get "$w" >/dev/null 2>&1; then
+              echo "\`$w\` does not exist yet - skipped." >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
             kubectl -n "$NAMESPACE" rollout restart "$w"
             kubectl -n "$NAMESPACE" rollout status "$w" --timeout=5m
             echo "\`$w\` restarted and rolled out." >> "$GITHUB_STEP_SUMMARY"

@@ -66,6 +66,11 @@ var (
 		Name: "nirn_proxy_global_429_total",
 		Help: "Global 429s received from Discord. Any increase means the configured global limit is above Discord's",
 	})
+
+	RouteLockCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "nirn_proxy_route_locks_total",
+		Help: "Long unbucketed 429s that locked a whole route for every guild, by route",
+	}, []string{"route"})
 )
 
 var registerWaitingGauges sync.Once

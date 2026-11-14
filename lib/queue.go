@@ -30,6 +30,9 @@ type QueueItem struct {
 type QueueChannel struct {
 	ch       chan *QueueItem
 	lastUsed time.Time
+	// blockedUntil is when this bucket's current rate limit resets, in unix
+	// nanoseconds. Zero or past means it is not blocked. See long_ratelimit.go.
+	blockedUntil atomic.Int64
 }
 
 type RequestQueue struct {
@@ -50,6 +53,9 @@ type RequestQueue struct {
 	takeGlobal func(ctx context.Context, item *QueueItem) error
 	// lockGlobal pauses the global limiter after a global 429. May be nil.
 	lockGlobal func(until time.Time)
+	// routeLocks holds route-wide rate limits: RouteKey -> reset, in unix
+	// nanoseconds. See long_ratelimit.go.
+	routeLocks sync.Map
 }
 
 func NewRequestQueue(processor func(ctx context.Context, item *QueueItem) (*http.Response, error), token string, bufferSize int) (*RequestQueue, error) {
@@ -214,6 +220,14 @@ func (q *RequestQueue) Queue(req *http.Request, res *http.ResponseWriter, path s
 		Priority: priority,
 		Deadline: deadline,
 		Arrived:  arrived,
+	}
+
+	// A bucket (or its whole route) that will not reset within this
+	// request's budget: say so now rather than queue it until the client
+	// gives up. Not sent, so nothing reaches Discord.
+	if wait, reason := q.blockedFor(ch, path, time.Now()); cannotWait(item, wait, time.Now()) {
+		shedRatelimited(item, reason, wait)
+		return nil
 	}
 
 	switch enqueue(ch, item) {
@@ -424,7 +438,23 @@ func (q *RequestQueue) subscribe(ch *QueueChannel, path string, pathHash uint64)
 
 	// Fail fast path for webhook 404s
 	var ret404 = false
-	for item := range ch.ch {
+	// Requests taken off the channel while a long limit was waited out, that
+	// could afford to wait: sent first, in arrival order.
+	var held []*QueueItem
+	closed := false
+	for {
+		var item *QueueItem
+		if len(held) > 0 {
+			item, held = held[0], held[1:]
+		} else {
+			if closed {
+				return
+			}
+			var ok bool
+			if item, ok = <-ch.ch; !ok {
+				return
+			}
+		}
 		ctx := context.WithValue(item.Req.Context(), "identifier", q.identifier)
 		if ret404 {
 			return404webhook(item)
@@ -470,6 +500,20 @@ func (q *RequestQueue) subscribe(ch *QueueChannel, path string, pathHash uint64)
 			item.errChan <- err
 			continue
 		}
+
+		// Marked blocked before the client is answered, so a request that
+		// arrives the moment this one returns already sees the limit.
+		reactionStuck := resp.StatusCode == 429 && scope == "shared" && (path == "/channels/!/messages/!/reactions/!modify" || path == "/channels/!/messages/!/reactions/!/!")
+		waitForReset := !reactionStuck && (remaining == 0 || resp.StatusCode == 429)
+		var until time.Time
+		if waitForReset {
+			until = time.Now().Add(resetAfter)
+			ch.blockedUntil.Store(until.UnixNano())
+			if shouldLockRoute(resp, scope, isGlobal, resetAfter) {
+				q.lockRoute(path, until)
+			}
+		}
+
 		item.doneChan <- resp
 
 		if resp.StatusCode == 429 && scope != "shared" {
@@ -514,14 +558,16 @@ func (q *RequestQueue) subscribe(ch *QueueChannel, path string, pathHash uint64)
 		}
 
 		// Prevent reaction bucket from being stuck
-		if resp.StatusCode == 429 && scope == "shared" && (path == "/channels/!/messages/!/reactions/!modify" || path == "/channels/!/messages/!/reactions/!/!") {
+		if reactionStuck {
 			prevRem, prevReset = remaining, resetAfter
 			continue
 		}
 
-		if remaining == 0 || resp.StatusCode == 429 {
-			duration := time.Until(time.Now().Add(resetAfter))
-			time.Sleep(duration)
+		if waitForReset {
+			var more []*QueueItem
+			more, closed = q.waitOutReset(ch, path, until)
+			held = append(held, more...)
+			ch.blockedUntil.Store(0)
 		}
 		prevRem, prevReset = remaining, resetAfter
 	}

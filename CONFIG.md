@@ -82,6 +82,16 @@ If you set it, keep it below the shortest client request timeout, because past t
 
 Default: 0
 
+##### LONG_RATELIMIT_FAIL_FAST_MS
+When a bucket is rate limited, a request that could not be sent before its deadline (`x-quark-max-wait-ms`, or `DEFAULT_MAX_WAIT_MS`) is answered at once with `429`, the real `retry_after`, `x-quark-shed-reason: bucket_ratelimited` (or `route_ratelimited`) and `x-quark-not-sent: true`. It is never sent to Discord. A request with no deadline is given this many milliseconds instead.
+
+Default: 10000
+
+##### ROUTE_LOCK_MIN_RESET_MS
+A `429` at least this long with no `x-ratelimit-bucket` locks its whole route (ids replaced by `!`, e.g. `/guilds/!/vanity-url`) for every guild until it resets. Discord limits some routes per bot rather than per guild, and without this each guild spends one real `429` finding out, which counts toward Cloudflare's invalid-request ban. `0` disables route locks.
+
+Default: 600000
+
 ## Request headers (Quark fork)
 Optional. All `x-quark-*` headers are removed before a request is forwarded to Discord.
 
@@ -92,6 +102,7 @@ Optional. All `x-quark-*` headers are removed before a request is forwarded to D
 - The global token is taken immediately before a request is sent, not when it arrives. A request that waits in its bucket and is then abandoned no longer uses up the budget.
 - A request whose client has disconnected is dropped without being sent, and without taking a token.
 - A global 429 from Discord pauses the whole global limiter until it expires. Before, the lock was recorded and never read.
+- A rate-limited bucket no longer holds requests it cannot send before their deadline: they are answered at once with the real `retry_after` (see `LONG_RATELIMIT_FAIL_FAST_MS`). Long unbucketed 429s lock the route for every guild (see `ROUTE_LOCK_MIN_RESET_MS`). Metric: `nirn_proxy_route_locks_total`.
 - Metrics: `nirn_proxy_global_wait_seconds`, `nirn_proxy_queue_wait_seconds`, `nirn_proxy_shed_total`, `nirn_proxy_cancelled_before_send_total`, `nirn_proxy_global_429_total`, `nirn_proxy_global_waiting`. Any increase in `nirn_proxy_global_429_total` means the configured global limit is above Discord's. Lower it with `BOT_RATELIMIT_OVERRIDES`. If several proxy pods run without clustering, divide the limit by the number of pods, because each pod enforces the limit on its own.
 
 ## Unstable env vars
