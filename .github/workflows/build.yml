@@ -113,7 +113,10 @@ jobs:
     timeout-minutes: 45
 
     env:
-      NAMESPACE: app-services
+      # The webhook proxies are moving from app-services to the egress
+      # namespace (quark-k8s egress/README.md). Each workload is looked up in
+      # both, so this job works before, during and after the move.
+      NAMESPACES: egress app-services
       IMAGE: ghcr.io/quark-bot-discord/nirn-proxy:main
       # kind/name, in restart order
       WORKLOADS: >-
@@ -134,15 +137,17 @@ jobs:
       - name: Check every proxy runs this image
         run: |
           set -euo pipefail
+          # The namespace a workload lives in, or nothing.
+          ns_of() { for n in $NAMESPACES; do kubectl -n "$n" get "$1" >/dev/null 2>&1 && { echo "$n"; return; }; done; }
           bad=0
           for w in $WORKLOADS; do
             # A workload not created yet (web-proxy, until quark-k8s#38 is
             # applied) is skipped, not a reason to hold back the others.
-            if ! kubectl -n "$NAMESPACE" get "$w" >/dev/null 2>&1; then
+            if [ -z "$(ns_of "$w")" ]; then
               echo "::warning::$w does not exist (or is not visible to the runner) - skipped"
               continue
             fi
-            img=$(kubectl -n "$NAMESPACE" get "$w" -o jsonpath='{.spec.template.spec.containers[0].image}')
+            img=$(kubectl -n "$(ns_of "$w")" get "$w" -o jsonpath='{.spec.template.spec.containers[0].image}')
             if [ "$img" != "$IMAGE" ]; then
               echo "::error::$w runs $img, not $IMAGE. Apply the quark-k8s proxy manifests first."
               bad=1
@@ -153,19 +158,22 @@ jobs:
       - name: Restart and wait
         run: |
           set -euo pipefail
+          # The namespace a workload lives in, or nothing.
+          ns_of() { for n in $NAMESPACES; do kubectl -n "$n" get "$1" >/dev/null 2>&1 && { echo "$n"; return; }; done; }
           for w in $WORKLOADS; do
-            if ! kubectl -n "$NAMESPACE" get "$w" >/dev/null 2>&1; then
+            if [ -z "$(ns_of "$w")" ]; then
               echo "\`$w\` does not exist yet - skipped." >> "$GITHUB_STEP_SUMMARY"
               continue
             fi
-            kubectl -n "$NAMESPACE" rollout restart "$w"
-            kubectl -n "$NAMESPACE" rollout status "$w" --timeout=5m
+            kubectl -n "$(ns_of "$w")" rollout restart "$w"
+            kubectl -n "$(ns_of "$w")" rollout status "$w" --timeout=5m
             echo "\`$w\` restarted and rolled out." >> "$GITHUB_STEP_SUMMARY"
           done
 
       - name: Show the pods
         if: always()
         run: |
+          ns_of() { for n in $NAMESPACES; do kubectl -n "$n" get "$1" >/dev/null 2>&1 && { echo "$n"; return; }; done; }
           for w in $WORKLOADS; do
-            kubectl -n "$NAMESPACE" get pods -l "app=${w#*/}" -o wide || true
+            kubectl -n "$(ns_of "$w")" get pods -l "app=${w#*/}" -o wide || true
           done
