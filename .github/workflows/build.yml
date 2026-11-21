@@ -109,7 +109,7 @@ jobs:
       github.event_name == 'push'
       && github.ref == 'refs/heads/main'
       && !contains(github.event.head_commit.message, '[skip deploy]')
-    runs-on: self-hosted
+    runs-on: quark-deploy
     timeout-minutes: 45
 
     env:
