@@ -4,6 +4,11 @@ on:
   release:
     types: [created]
 
+# The org's default workflow token is read-only. This job commits to the
+# branch (or creates a release), so it asks for write access here.
+permissions:
+  contents: write
+
 jobs:
   releases-matrix:
     name: Release Go Binary
