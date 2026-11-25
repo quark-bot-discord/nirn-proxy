@@ -9,12 +9,11 @@ on:
   pull_request:
     branches: [main]
 
-# One run on `main` at a time, in push order. Two builds side by side could
-# finish out of order and leave the older image under the tag, and so in the
-# cluster. Any other ref is a group of its own.
+# A newer run for the same pull request or branch cancels this one. Pushes to
+# main/development are queued instead, so a deploy or digest pin is never cut off halfway.
 concurrency:
-  group: build-${{ github.ref == 'refs/heads/main' && github.ref || github.run_id }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.ref != 'refs/heads/main' && github.ref != 'refs/heads/development') }}
 
 permissions:
   contents: read
@@ -105,7 +104,7 @@ jobs:
         if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/development') && !contains(github.event.head_commit.message, '[skip deploy]')
         env:
           GH_TOKEN: ${{ steps.digest-bot.outputs.token }}
-          IMAGES: ${{ fromJSON(steps.build.outputs.metadata)['image.name'] }}
+          IMAGES: ${{ fromJSON(steps.build.outputs.metadata || '{}')['image.name'] }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           git clone -q --depth 50 "https://x-access-token:${GH_TOKEN}@github.com/quark-bot-discord/quark-k8s" "$RUNNER_TEMP/quark-k8s"
